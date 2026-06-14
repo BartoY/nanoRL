@@ -164,7 +164,8 @@ def main():
             # --- 保存最佳模型 ---
             if avg_val_mksp < best_val_makespan:
                 best_val_makespan = avg_val_mksp
-                torch.save(policy_model.module.state_dict(), f"/home/yifan/hang/nanoRL/models_save/{N_J}_{N_M}_best_model_{BATCH_SIZE}.pth")
+                # torch.save(policy_model.module.state_dict(), f"/home/yifan/hang/nanoRL/models_save/{N_J}_{N_M}_best_model_{BATCH_SIZE}.pth")
+                torch.save(policy_model.module.state_dict(), f"/raid/hangy/nanoRL/models_save/{N_J}_{N_M}_best_model_{BATCH_SIZE}.pth")
                 print(f"  >>> New Best Model Saved! (Val Mksp: {best_val_makespan:.2f})")
 
             # --- Update Baseline ---
