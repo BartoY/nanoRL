@@ -188,7 +188,7 @@ class BaseGNN(nn.Module):
 
 
 class GPTDecoder(nn.Module):
-    def __init__(self, hidden_dim, n_layers=4, n_heads=8):
+    def __init__(self, hidden_dim, n_layers=12, n_heads=12):
         super().__init__()
         self.hidden_dim = hidden_dim
         # self.n_j = n_j
@@ -473,7 +473,7 @@ class GPTDecoder(nn.Module):
 
 
 class FJSPActor(nn.Module):
-    def __init__(self, op_input_dim, mach_input_dim, hidden_dim, metadata, n_layers=4, n_heads=8):
+    def __init__(self, op_input_dim, mach_input_dim, hidden_dim, metadata, n_layers=12, n_heads=12):
         super().__init__()
         self.op_emb = nn.Linear(op_input_dim, hidden_dim)
         self.mach_emb = nn.Linear(mach_input_dim, hidden_dim)

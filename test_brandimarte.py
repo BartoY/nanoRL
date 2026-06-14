@@ -14,9 +14,9 @@ from ortools_solver import fjsp_solver
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # DEVICE = torch.device("cpu")
 
-HIDDEN_DIM = 256
-N_LAYERS = 4
-N_HEADS = 8
+HIDDEN_DIM = 768
+N_LAYERS = 12
+N_HEADS = 12
 
 NUM_SAMPLES = 512
 OR_TOOLS_LIMIT = 1800.0

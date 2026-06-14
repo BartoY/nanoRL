@@ -19,7 +19,7 @@ from validate import validate_model
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # DEVICE = torch.device("cpu")
 LR = 1e-5
-BATCH_SIZE = 56
+BATCH_SIZE = 16
 EPOCHS = 30
 N_J = 10
 N_M = 6
@@ -41,7 +41,7 @@ def main():
     dummy_data = _generate_single_instance(0, N_J, N_M, MIN_OP, MAX_OP, return_pyg=True)
     metadata = dummy_data.metadata()
     # 初始化模型
-    policy_model = FJSPActor(op_input_dim=6, mach_input_dim=3, hidden_dim=256, metadata=metadata, n_layers=4, n_heads=8).to(DEVICE)
+    policy_model = FJSPActor(op_input_dim=6, mach_input_dim=3, hidden_dim=768, metadata=metadata, n_layers=12, n_heads=12).to(DEVICE)
     baseline_model = deepcopy(policy_model)
     baseline_model.eval()
 
