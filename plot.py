@@ -5,11 +5,12 @@ import time
 
 matplotlib.use('Agg')
 
-bsz = 128
+bsz = 8
 num_sim = 500
 
 
-def plot_learning_curves(loss_history, train_makespan, val_makespan, save_dir="/home/yifan/hang/nanoRL/draw_loss"):
+def plot_learning_curves(loss_history, train_makespan, val_makespan, save_dir="/raid/hangy/nanoRL/draw_loss"):
+# def plot_learning_curves(loss_history, train_makespan, val_makespan, save_dir="/home/yifan/hang/nanoRL/draw_loss"):
     """
     绘制并保存训练过程中的Loss和Makespan曲线
     """
