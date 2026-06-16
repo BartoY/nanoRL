@@ -19,12 +19,12 @@ from validate import validate_model
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # DEVICE = torch.device("cpu")
 LR = 1e-5
-BATCH_SIZE = 8
+BATCH_SIZE = 12
 EPOCHS = 30
-N_J = 10
-N_M = 6
+N_J = 15
+N_M = 10
 MIN_OP = 5
-MAX_OP = 6
+MAX_OP = 15
 n_simple = 1024000
 ENTROPY_COEF = 0.01   # 熵正则化系数
 TEMP_START = 1.5     # 初始温度
