@@ -196,7 +196,7 @@ class GPTDecoder(nn.Module):
         # self.max_op = max_op
         #
         # max_seq_len = n_j * max_op  # 最大决策步数
-        config = GPTConfig(n_embd=hidden_dim, n_head=n_heads, dropout=0.0, block_size=10000)
+        config = GPTConfig(n_embd=hidden_dim, n_head=n_heads, dropout=0.0, block_size=2000)
 
         # 位置编码
         self.wpe = nn.Embedding(config.block_size, hidden_dim)
