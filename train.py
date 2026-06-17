@@ -20,7 +20,7 @@ from validate import validate_model
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # DEVICE = torch.device("cpu")
 LR = 1e-5
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 EPOCHS = 30
 N_J = 15
 N_M = 10
