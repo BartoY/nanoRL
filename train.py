@@ -7,6 +7,7 @@ from torch_geometric.loader import DataLoader
 from copy import deepcopy
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.cuda.amp import GradScaler, autocast
 
 from model import FJSPActor
 from utils import fjsp_sched_bch, chk_upd_bl
@@ -41,13 +42,14 @@ def main():
     dummy_data = _generate_single_instance(0, N_J, N_M, MIN_OP, MAX_OP, return_pyg=True)
     metadata = dummy_data.metadata()
     # 初始化模型
-    policy_model = FJSPActor(op_input_dim=6, mach_input_dim=3, hidden_dim=768, metadata=metadata, n_layers=12, n_heads=12).to(DEVICE)
+    policy_model = FJSPActor(op_input_dim=6, mach_input_dim=3, hidden_dim=256, metadata=metadata, n_layers=6, n_heads=8).to(DEVICE)
     baseline_model = deepcopy(policy_model)
     baseline_model.eval()
 
     policy_model = DDP(policy_model, device_ids=[local_rank], output_device=local_rank)
 
     optimizer = optim.Adam(policy_model.parameters(), lr=LR)
+    scaler = GradScaler()
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
     # 验证集
@@ -95,48 +97,50 @@ def main():
             mask_machine_compat = batch.compat_mask.view(bsz, n_node, N_M).bool()
 
             job_length = batch.job_length.view(bsz, N_J)
-
-            job_seq, mach_assign, log_probs, entropy = policy_model(
-                batch,
-                mask_machine_compat,
-                op_proc_time,
-                job_length,
-                rollout=False,
-                temperature=current_temp
-            )
-
-            with torch.no_grad():
-                base_job_seq, base_mach_assign, *_ = baseline_model(
+            with autocast(dtype=torch.bfloat16):
+                job_seq, mach_assign, log_probs, entropy = policy_model(
                     batch,
                     mask_machine_compat,
                     op_proc_time,
                     job_length,
-                    rollout=True
+                    rollout=False,
+                    temperature=current_temp
                 )
-                _, costs = fjsp_sched_bch(job_sequence=job_seq,
-                                      mach_sequence=mach_assign,
-                                      proc_times=op_proc_time, n_j=N_J, n_m=N_M, n_op=MAX_OP, job_length=job_length)
-                _, base_costs = fjsp_sched_bch(job_sequence=base_job_seq,
-                                           mach_sequence=base_mach_assign,
-                                           proc_times=op_proc_time, n_j=N_J, n_m=N_M, n_op=MAX_OP, job_length=job_length)
 
-                # --- Loss ---
-                advantage = (costs - base_costs).detach()
+                with torch.no_grad():
+                    base_job_seq, base_mach_assign, *_ = baseline_model(
+                        batch,
+                        mask_machine_compat,
+                        op_proc_time,
+                        job_length,
+                        rollout=True
+                    )
+                    _, costs = fjsp_sched_bch(job_sequence=job_seq,
+                                          mach_sequence=mach_assign,
+                                          proc_times=op_proc_time, n_j=N_J, n_m=N_M, n_op=MAX_OP, job_length=job_length)
+                    _, base_costs = fjsp_sched_bch(job_sequence=base_job_seq,
+                                               mach_sequence=base_mach_assign,
+                                               proc_times=op_proc_time, n_j=N_J, n_m=N_M, n_op=MAX_OP, job_length=job_length)
+
+                    # --- Loss ---
+                    advantage = (costs - base_costs).detach()
 
                 # Advantage归一化
                 # if advantage.numel() > 1:
                 #     advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
 
-            rl_loss = (advantage * log_probs).mean()
+                rl_loss = (advantage * log_probs).mean()
 
-            entropy_bonus = entropy.mean() * ENTROPY_COEF
-            loss = rl_loss - entropy_bonus
-            # loss = rl_loss
+                entropy_bonus = entropy.mean() * ENTROPY_COEF
+                loss = rl_loss - entropy_bonus
+                # loss = rl_loss
 
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item()
             total_train_mksp += costs.mean().item()
