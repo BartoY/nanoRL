@@ -7,7 +7,7 @@ from torch_geometric.loader import DataLoader
 from copy import deepcopy
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 from model import FJSPActor
 from utils import fjsp_sched_bch, chk_upd_bl
@@ -47,10 +47,10 @@ def main():
     baseline_model = deepcopy(policy_model)
     baseline_model.eval()
 
-    policy_model = DDP(policy_model, device_ids=[local_rank], output_device=local_rank)
+    policy_model = DDP(policy_model, device_ids=[local_rank], output_device=local_rank,find_unused_parameters=True)
 
     optimizer = optim.Adam(policy_model.parameters(), lr=LR)
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     if local_rank == 0:
         # 1. 初始化 wandb，记录超参数
@@ -111,7 +111,7 @@ def main():
             mask_machine_compat = batch.compat_mask.view(bsz, n_node, N_M).bool()
 
             job_length = batch.job_length.view(bsz, N_J)
-            with autocast(dtype=torch.bfloat16):
+            with autocast(device_type='cuda', dtype=torch.bfloat16):
                 job_seq, mach_assign, log_probs, entropy = policy_model(
                     batch,
                     mask_machine_compat,
