@@ -31,4 +31,4 @@ def override(fn):
     return fn
 
 if __name__ == '__main__':
-    print(uni_instance_gen(n_j=6, n_m=6, min_op=1, max_op=6, low=0.01, high=1.0, flexibility=0.5))
+    print(uni_instance_gen(n_j=6, n_m=6, min_op=1, max_op=6, low=0.01, high=1.0))

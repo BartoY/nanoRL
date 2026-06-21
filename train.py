@@ -14,13 +14,14 @@ from utils import fjsp_sched_bch, chk_upd_bl
 from plot import plot_learning_curves
 from data_utils import epoch_dataset_gen, _generate_single_instance
 from validate import validate_model
+import wandb
 # os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 
 # --- 超参数 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # DEVICE = torch.device("cpu")
-LR = 1e-5
-BATCH_SIZE = 24
+LR = 5e-5
+BATCH_SIZE = 256
 EPOCHS = 30
 N_J = 15
 N_M = 10
@@ -51,7 +52,20 @@ def main():
     optimizer = optim.Adam(policy_model.parameters(), lr=LR)
     scaler = GradScaler()
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
-
+    if local_rank == 0:
+        # 1. 初始化 wandb，记录超参数
+        wandb.init(
+            project="nanoRL-FJSP",  # 你的项目名称
+            name=f"Run_NJ{N_J}_NM{N_M}_BSZ{BATCH_SIZE}",  # 实验名称
+            config={
+                "batch_size": BATCH_SIZE,
+                "learning_rate": LR,
+                "epochs": EPOCHS,
+                "entropy_coef": ENTROPY_COEF,
+                "n_j": N_J,
+                "n_m": N_M
+            }
+        )
     # 验证集
     if local_rank == 0:
         val_data_list = epoch_dataset_gen(n_samples=1024, n_j=N_J, n_m=N_M, min_op=MIN_OP, max_op=MAX_OP)
@@ -157,6 +171,14 @@ def main():
 
             policy_val_costs = validate_model(policy_model, val_loader, DEVICE, N_J, N_M, MAX_OP)
             avg_val_mksp = policy_val_costs.mean()
+            # 实时记录数据到 WandB
+            wandb.log({
+                "Epoch": epoch + 1,
+                "Loss/Train": avg_loss,
+                "Makespan/Train": avg_train_mksp,
+                "Makespan/Validation": avg_val_mksp,
+                "Temperature": current_temp,
+            })
 
             print(f"Epoch {epoch + 1}: Loss {avg_loss:.4f} | Train Mksp {avg_train_mksp:.2f} | Val Mksp {avg_val_mksp:.2f}")
 
@@ -183,9 +205,11 @@ def main():
             if local_rank == 0:
                 print("Updating Baseline...")
             baseline_model.load_state_dict(policy_model.module.state_dict())
+
     if local_rank == 0:
         print("Training finished. Plotting curves...")
         plot_learning_curves(history_loss, history_train_mksp, history_val_mksp)
+        wandb.finish()
 
     dist.destroy_process_group()
 

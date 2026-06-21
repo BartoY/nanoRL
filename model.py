@@ -7,6 +7,7 @@ from torch_geometric.nn import GATv2Conv, to_hetero
 # from torch_geometric.nn import SAGEConv
 from torch_geometric.utils import to_dense_batch
 import math
+import contextlib
 
 
 class Attention(nn.Module):
@@ -191,11 +192,6 @@ class GPTDecoder(nn.Module):
     def __init__(self, hidden_dim, n_layers=12, n_heads=12):
         super().__init__()
         self.hidden_dim = hidden_dim
-        # self.n_j = n_j
-        # self.n_m = n_m
-        # self.max_op = max_op
-        #
-        # max_seq_len = n_j * max_op  # 最大决策步数
         config = GPTConfig(n_embd=hidden_dim, n_head=n_heads, dropout=0.0, block_size=2000)
 
         # 位置编码
@@ -250,226 +246,299 @@ class GPTDecoder(nn.Module):
 
         curr_input = graph_context + self.start_token.expand(bsz, -1)  # [B, H]
         seq_inputs = []
-        # hx = graph_context
 
         job_next_op_local_idx = torch.zeros(bsz, n_j, dtype=torch.long, device=device)
-        mask_job_finished = torch.zeros(bsz, n_j, dtype=torch.bool, device=device)
+        mask_job_finished = (job_length == 0)
 
         job_ready_time = torch.zeros(bsz, n_j, device=device)
         machine_avail_time = torch.zeros(bsz, n_m, device=device)
 
-        job_indices_seq = []
-        machine_assign_list = []
-        log_probs_op = []
-        log_probs_mach = []
-
-        entropy_op = []
-        entropy_mach = []
-
         # 每个Job当前待选工序的全局Node Index, base_indices: [0, max_op, 2*max_op, ...]
         base_indices = torch.arange(0, n_j * max_op, max_op, device=device).unsqueeze(0).expand(bsz, -1)
-
         avg_op_pt = (op_proc_time * mask_machine_compat.float()
                      ).sum(-1) / mask_machine_compat.float().sum(-1).clamp(min=1.0)
-
-        mask_job_finished = (job_length == 0)
-
         max_steps = int(job_length.sum(dim=1).max().item())
 
-        for i in range(max_steps):
-            # 将当前的 input 存入序列
-            seq_inputs.append(curr_input)   # list of [B, H]
+        actions_job_list = []
+        actions_mach_list = []
 
-            # 将历史记录拼接成[B, T, H]
-            x_seq = torch.stack(seq_inputs, dim=1)
-            T = x_seq.size(1)
+        sel_node_idx_list = []
+        safe_indices_list = []
+        dyn_feats_list = []
+        mask_job_finished_list = []
+        batch_is_done_list = []
+        curr_op_mach_compat_list = []
+        k_mach_dyn_list = []
 
-            # 生成位置编码
-            pos = torch.arange(0, T, dtype=torch.long, device=device)  # [T]
-            pos_emb = self.wpe(pos)  # [T, H]
+        seq_inputs = []
 
-            # 输入 GPT
-            x = self.drop(x_seq + pos_emb)
-            for block in self.h:
-                x = block(x)
-            x = self.ln_f(x)  # [B, T, H]
-            hx = x[:, -1, :]  # [B, H]
-            q_op = hx.unsqueeze(1)
-            glimpse_op = self.op_pointer_att(q=q_op, k=encoder_out, v=encoder_out, mask=mask_padding)
+        with torch.no_grad() if not rollout else contextlib.nullcontext():
+            for i in range(max_steps):
+                # 将当前的 input 存入序列
+                seq_inputs.append(curr_input)   # list of [B, H]
 
-            current_global_indices = base_indices + job_next_op_local_idx
-            safe_indices = current_global_indices.clamp(max=n_node - 1)
+                # 将历史记录拼接成[B, T, H]
+                x_seq = torch.stack(seq_inputs, dim=1)
+                T_curr = x_seq.size(1)
 
-            # k_logits_all: [B, N_tasks, H] -> [B, n_j, H]
-            safe_indices_expanded = safe_indices.unsqueeze(-1).expand(-1, -1, self.hidden_dim)
-            k_candidates = torch.gather(k_logits_all, 1, safe_indices_expanded)
+                # 生成位置编码
+                pos = torch.arange(0, T_curr, dtype=torch.long, device=device)  # [T]
+                pos_emb = self.wpe(pos)  # [T, H]
 
-            cand_pt_est = torch.gather(avg_op_pt, 1, safe_indices)
+                # 输入 GPT
+                x = self.drop(x_seq + pos_emb)
+                for block in self.h:
+                    x = block(x)
+                x = self.ln_f(x)  # [B, T, H]
+                hx = x[:, -1, :]  # [B, H]
+                q_op = hx.unsqueeze(1)
+                glimpse_op = self.op_pointer_att(q=q_op, k=encoder_out, v=encoder_out, mask=mask_padding)
 
-            # avg_mach_avail = machine_avail_time.mean(dim=1, keepdim=True).expand(-1, self.n_j)
-            # 当前候选工序的机器兼容矩阵
-            cand_mach_mask = torch.gather(mask_machine_compat, 1, safe_indices.unsqueeze(-1).expand(-1, -1, n_m))
-            avail_time_expanded = machine_avail_time.unsqueeze(1).expand(-1, n_j, -1)
-            valid_avail_time = avail_time_expanded.masked_fill(~cand_mach_mask, float('inf'))
-            min_comp_mach_avail = valid_avail_time.min(dim=-1)[0]  # [B, n_j]
+                current_global_indices = base_indices + job_next_op_local_idx
+                safe_indices = current_global_indices.clamp(max=n_node - 1)
+                safe_indices_list.append(safe_indices)  # [Cache]
 
-            min_comp_mach_avail = min_comp_mach_avail.masked_fill(min_comp_mach_avail == float('inf'), 0.0)
+                # k_logits_all: [B, N_tasks, H] -> [B, n_j, H]
+                safe_indices_expanded = safe_indices.unsqueeze(-1).expand(-1, -1, self.hidden_dim)
+                k_candidates = torch.gather(k_logits_all, 1, safe_indices_expanded)
 
-            e_start = torch.max(job_ready_time, min_comp_mach_avail)  # 最早开始时间
-            e_comp = e_start + cand_pt_est  # 预计完成时间
-            wait_time = e_start - job_ready_time  # 工件等待时间
-            idle_time = e_start - min_comp_mach_avail  # 机器空闲时间
-            ops_left_ratio = (job_length - job_next_op_local_idx) / job_length.clamp(min=1)
-            ops_left_ratio = ops_left_ratio.float()  # 剩余工序比例
-            pt_ratio = cand_pt_est / (cand_pt_est.mean(dim=-1, keepdim=True) + 1e-5)  # 剩余加工时间
+                # 当前候选工序的机器兼容矩阵
+                cand_pt_est = torch.gather(avg_op_pt, 1, safe_indices)
+                cand_mach_mask = torch.gather(mask_machine_compat, 1, safe_indices.unsqueeze(-1).expand(-1, -1, n_m))
+                avail_time_expanded = machine_avail_time.unsqueeze(1).expand(-1, n_j, -1)
+                valid_avail_time = avail_time_expanded.masked_fill(~cand_mach_mask, float('inf'))
+                min_comp_mach_avail = valid_avail_time.min(dim=-1)[0]  # [B, n_j]
+                min_comp_mach_avail = min_comp_mach_avail.masked_fill(min_comp_mach_avail == float('inf'), 0.0)
 
-            job_progress = 1.0 - ops_left_ratio.float()
-            valid_job_mask = (job_length > 0).float()
-            mean_progress = (job_progress * valid_job_mask).sum(dim=1, keepdim=True) / \
-                            valid_job_mask.sum(dim=1,keepdim=True).clamp(min=1.0)
-            progress_diff = job_progress - mean_progress  # [B, n_j]
+                e_start = torch.max(job_ready_time, min_comp_mach_avail)  # 最早开始时间
+                e_comp = e_start + cand_pt_est  # 预计完成时间
+                wait_time = e_start - job_ready_time  # 工件等待时间
+                idle_time = e_start - min_comp_mach_avail  # 机器空闲时间
+                ops_left_ratio = (job_length - job_next_op_local_idx) / job_length.clamp(min=1)  # 剩余工序比例
+                pt_ratio = cand_pt_est / (cand_pt_est.mean(dim=-1, keepdim=True) + 1e-5)  # 剩余加工时间
 
-            norm_factor = torch.max(machine_avail_time, dim=1, keepdim=True)[0].clamp(min=1.0)
-            dyn_feats = torch.stack([
-                e_start / norm_factor,
-                e_comp / norm_factor,
-                wait_time / norm_factor,
-                idle_time / norm_factor,
-                ops_left_ratio.float(),
-                pt_ratio,
-                progress_diff
-            ], dim=-1)  # [B, n_j, 7]
+                job_progress = 1.0 - ops_left_ratio.float()
+                valid_job_mask = (job_length > 0).float()
+                mean_progress = (job_progress * valid_job_mask).sum(dim=1, keepdim=True) / \
+                                valid_job_mask.sum(dim=1,keepdim=True).clamp(min=1.0)
+                progress_diff = job_progress - mean_progress  # [B, n_j]
 
-            cat_feats = torch.cat([k_candidates, dyn_feats], dim=-1)
-            k_candidates_fused = self.fusion_net(cat_feats)  # [B, n_j, H]
+                norm_factor = torch.max(machine_avail_time, dim=1, keepdim=True)[0].clamp(min=1.0)
+                dyn_feats = torch.stack([
+                    e_start / norm_factor,
+                    e_comp / norm_factor,
+                    wait_time / norm_factor,
+                    idle_time / norm_factor,
+                    ops_left_ratio.float(),
+                    pt_ratio,
+                    progress_diff
+                ], dim=-1)  # [B, n_j, 7]
+                dyn_feats_list.append(dyn_feats)  # [Cache]
 
-            # ---计算 Logits---
-            u_op = torch.matmul(glimpse_op, k_candidates_fused.transpose(-2, -1)) / (self.hidden_dim ** 0.5)
-            u_op = torch.tanh(u_op) * self.tanh_clipping / temperature
-            u_op = u_op.squeeze(1)
+                cat_feats = torch.cat([k_candidates, dyn_feats], dim=-1)
+                k_candidates_fused = self.fusion_net(cat_feats)  # [B, n_j, H]
 
-            batch_is_done = mask_job_finished.all(dim=-1)  # [B]
+                # ---计算 Logits---
+                u_op = torch.matmul(glimpse_op, k_candidates_fused.transpose(-2, -1)) / (self.hidden_dim ** 0.5)
+                u_op = torch.tanh(u_op) * self.tanh_clipping / temperature
+                u_op = u_op.squeeze(1)
 
-            is_all_masked = mask_job_finished.all(dim=-1, keepdim=True)
-            mask_job_finished = mask_job_finished.masked_fill(is_all_masked, False)
+                batch_is_done = mask_job_finished.all(dim=-1)  # [B]
+                batch_is_done_list.append(batch_is_done)  # [Cache]
 
-            # ---Mask掉已完成的Job---
-            u_op = u_op.masked_fill(mask_job_finished, float('-inf'))
+                is_all_masked = mask_job_finished.all(dim=-1, keepdim=True)
+                mask_job_finished = mask_job_finished.masked_fill(is_all_masked, False)
+                mask_job_finished_list.append(mask_job_finished)  # [Cache]
 
-            u_op_safe = u_op.masked_fill(batch_is_done.unsqueeze(-1), 0.0)
-            u_op_safe = u_op_safe.masked_fill(mask_job_finished & ~batch_is_done.unsqueeze(-1), float('-inf'))
+                # ---Mask掉已完成的Job---
+                u_op = u_op.masked_fill(mask_job_finished, float('-inf'))
+                u_op_safe = u_op.masked_fill(batch_is_done.unsqueeze(-1), 0.0)
+                u_op_safe = u_op_safe.masked_fill(mask_job_finished & ~batch_is_done.unsqueeze(-1), float('-inf'))
 
-            # 采样/贪婪选择
-            if rollout:
-                selected_job = u_op_safe.max(-1)[1]
-            else:
-                probs = F.softmax(u_op_safe, dim=-1)
-                m_op = Categorical(probs)
-                selected_job = m_op.sample()
-                # 只记录有效 batch 的对数概率和熵
-                log_probs_op.append(m_op.log_prob(selected_job) * (~batch_is_done).float())
-                entropy_op.append(m_op.entropy() * (~batch_is_done).float())
+                # 采样/贪婪选择
+                if rollout:
+                    selected_job = u_op_safe.max(-1)[1]
+                else:
+                    probs = F.softmax(u_op_safe, dim=-1)
+                    selected_job = Categorical(probs).sample()
+                    # 只记录有效 batch 的对数概率和熵
 
-            selected_job = selected_job.masked_fill(batch_is_done, 0)
-            job_indices_seq.append(selected_job)
+                selected_job = selected_job.masked_fill(batch_is_done, 0)
+                actions_job_list.append(selected_job)
 
-            # ---------------------------------------------------------
-            # Low-Level: 为选出的工序分配机器
-            # ---------------------------------------------------------
-            sel_job_unsq = selected_job.unsqueeze(1)
-            sel_node_idx = torch.gather(current_global_indices, 1, sel_job_unsq)
-            idx_exp = sel_node_idx.unsqueeze(-1)
+                # ---------------------------------------------------------
+                # Low-Level: 为选出的工序分配机器
+                # ---------------------------------------------------------
+                sel_job_unsq = selected_job.unsqueeze(1)
+                sel_node_idx = torch.gather(current_global_indices, 1, sel_job_unsq)
+                sel_node_idx_list.append(sel_node_idx)  # [Cache]
 
-            selected_op_emb = torch.gather(encoder_out, 1,
-                                           idx_exp.expand(-1, -1, self.hidden_dim)
-                                           ).squeeze(1)
+                idx_exp = sel_node_idx.unsqueeze(-1)
+                selected_op_emb = torch.gather(encoder_out, 1,
+                                               idx_exp.expand(-1, -1, self.hidden_dim)
+                                               ).squeeze(1)
 
-            q_mach_raw = torch.cat([hx, selected_op_emb], dim=-1)
-            q_mach = self.q_mach_proj(q_mach_raw).unsqueeze(1)
+                q_mach_raw = torch.cat([hx, selected_op_emb], dim=-1)
+                q_mach = self.q_mach_proj(q_mach_raw).unsqueeze(1)
 
-            # base_k_mach = self.machine_embeds.expand(bsz, -1, -1)
-            base_k_mach = mach_dense  # [B, n_m, H]
+                # base_k_mach = self.machine_embeds.expand(bsz, -1, -1)
+                # base_k_mach = mach_dense  # [B, n_m, H]
 
-            curr_op_mach_compat = torch.gather(
-                mask_machine_compat, 1, idx_exp.expand(-1, -1, n_m)
-            ).squeeze(1)
+                curr_op_mach_compat = torch.gather(
+                    mask_machine_compat, 1, idx_exp.expand(-1, -1, n_m)
+                ).squeeze(1)
+                curr_op_mach_compat_list.append(curr_op_mach_compat)  # [Cache]
 
-            curr_op_pt = torch.gather(
-                op_proc_time, 1, idx_exp.expand(-1, -1, n_m)
-            ).squeeze(1)
-            curr_op_pt = curr_op_pt.masked_fill(~curr_op_mach_compat, 0.0)
+                curr_op_pt = torch.gather(op_proc_time, 1, idx_exp.expand(-1, -1, n_m)).squeeze(1)
+                curr_op_pt = curr_op_pt.masked_fill(~curr_op_mach_compat, 0.0)
 
-            chosen_job_ready = torch.gather(job_ready_time, 1, sel_job_unsq)  # [B, 1]
-            est_start = torch.max(chosen_job_ready, machine_avail_time)  # [B, n_m]
-            est_comp = est_start + curr_op_pt  # [B, n_m]
+                chosen_job_ready = torch.gather(job_ready_time, 1, sel_job_unsq)  # [B, 1]
+                est_start = torch.max(chosen_job_ready, machine_avail_time)  # [B, n_m]
+                est_comp = est_start + curr_op_pt  # [B, n_m]
+                est_comp_on_mach = est_comp.masked_fill(~curr_op_mach_compat, 0.0)
 
-            est_comp_on_mach = est_comp.masked_fill(~curr_op_mach_compat, 0.0)
+                max_avail = torch.max(machine_avail_time, dim=1, keepdim=True)[0].clamp(min=1.0)
+                norm_mach_avail = (machine_avail_time / max_avail).unsqueeze(-1)  # 机器空闲时间 [B, n_m, 1]
+                norm_curr_op_pt = (curr_op_pt / max_avail).unsqueeze(-1)  # 耗时代价 [B, n_m, 1]
+                norm_est_comp = (est_comp_on_mach / max_avail).unsqueeze(-1)  # 最终完工时间[B, n_m, 1]
+                mach_idle_relative = ((max_avail - machine_avail_time) / max_avail).unsqueeze(-1)
 
-            max_avail = torch.max(machine_avail_time, dim=1, keepdim=True)[0].clamp(min=1.0)
-            norm_mach_avail = (machine_avail_time / max_avail).unsqueeze(-1)  # 机器空闲时间 [B, n_m, 1]
-            norm_curr_op_pt = (curr_op_pt / max_avail).unsqueeze(-1)  # 耗时代价 [B, n_m, 1]
-            norm_est_comp = (est_comp_on_mach / max_avail).unsqueeze(-1)  # 最终完工时间[B, n_m, 1]
-            mach_idle_relative = ((max_avail - machine_avail_time) / max_avail).unsqueeze(-1)
+                k_mach_dyn = torch.cat([norm_mach_avail, norm_curr_op_pt, norm_est_comp, mach_idle_relative], dim=-1)
+                k_mach_dyn_list.append(k_mach_dyn)  # [Cache]
 
-            k_mach_concat = torch.cat([base_k_mach, norm_mach_avail, norm_curr_op_pt,
-                                       norm_est_comp,mach_idle_relative], dim=-1)
-            k_mach = self.dyn_mach_proj(k_mach_concat)
+                k_mach_concat = torch.cat([mach_dense, k_mach_dyn], dim=-1)
+                k_mach = self.dyn_mach_proj(k_mach_concat)
 
-            # 底层 Glimpse 和 Logits
-            glimpse_mach = self.mach_pointer_att(q=q_mach, k=k_mach, v=k_mach)
-            u_mach = torch.matmul(glimpse_mach, k_mach.transpose(-2, -1)) / (self.hidden_dim ** 0.5)
-            u_mach = u_mach.squeeze(1)  # [B, n_m]
+                # 底层 Glimpse 和 Logits
+                glimpse_mach = self.mach_pointer_att(q=q_mach, k=k_mach, v=k_mach)
+                u_mach = torch.matmul(glimpse_mach, k_mach.transpose(-2, -1)) / (self.hidden_dim ** 0.5)
+                u_mach = u_mach.squeeze(1)  # [B, n_m]
 
-            curr_op_mach_compat = torch.gather(mask_machine_compat, 1,
-                                               sel_node_idx.unsqueeze(-1).expand(-1, -1, n_m)).squeeze(1)
+                u_mach_safe = u_mach.masked_fill(batch_is_done.unsqueeze(-1), 0.0)
+                u_mach_safe = u_mach_safe.masked_fill(~curr_op_mach_compat & ~batch_is_done.unsqueeze(-1), float('-inf'))
 
-            u_mach_safe = u_mach.masked_fill(batch_is_done.unsqueeze(-1), 0.0)
-            u_mach_safe = u_mach_safe.masked_fill(~curr_op_mach_compat & ~batch_is_done.unsqueeze(-1), float('-inf'))
+                if rollout:
+                    selected_mach = u_mach_safe.max(-1)[1]
+                else:
+                    selected_mach = Categorical(F.softmax(u_mach_safe, dim=-1)).sample()
+                selected_mach = selected_mach.masked_fill(batch_is_done, 0)
+                actions_mach_list.append(selected_mach)
 
-            if rollout:
-                selected_mach = u_mach_safe.max(-1)[1]
-            else:
-                m_mach = Categorical(F.softmax(u_mach_safe, dim=-1))
-                selected_mach = m_mach.sample()
-                log_probs_mach.append(m_mach.log_prob(selected_mach) * (~batch_is_done).float())
-                entropy_mach.append(m_mach.entropy() * (~batch_is_done).float())
-            selected_mach = selected_mach.masked_fill(batch_is_done, 0)
-            machine_assign_list.append(selected_mach)
+                batch_idx = torch.arange(bsz, device=device)
+                chosen_pt = op_proc_time[batch_idx, sel_node_idx.squeeze(1), selected_mach]  # [B]
 
-            batch_idx = torch.arange(bsz, device=device)
-            chosen_pt = op_proc_time[batch_idx, sel_node_idx.squeeze(1), selected_mach]  # [B]
+                chosen_job_ready = torch.gather(job_ready_time, 1, sel_job_unsq).squeeze(1)  # [B]
+                chosen_mach_avail = torch.gather(machine_avail_time, 1, selected_mach.unsqueeze(1)).squeeze(1)  # [B]
 
-            chosen_job_ready = torch.gather(job_ready_time, 1, sel_job_unsq).squeeze(1)  # [B]
-            chosen_mach_avail = torch.gather(machine_avail_time, 1, selected_mach.unsqueeze(1)).squeeze(1)  # [B]
+                actual_start = torch.max(chosen_job_ready, chosen_mach_avail)
+                actual_comp = actual_start + chosen_pt
+                actual_comp = torch.where(batch_is_done, chosen_job_ready, actual_comp)
 
-            actual_start = torch.max(chosen_job_ready, chosen_mach_avail)
-            actual_comp = actual_start + chosen_pt
+                job_ready_time.scatter_(1, sel_job_unsq, actual_comp.unsqueeze(1))
+                machine_avail_time.scatter_(1, selected_mach.unsqueeze(1), actual_comp.unsqueeze(1))
 
-            actual_comp = torch.where(batch_is_done, chosen_job_ready, actual_comp)
+                one_hot = F.one_hot(selected_job, num_classes=n_j)  # [B, n_j]
+                step_active = (~batch_is_done).unsqueeze(-1).long()
+                job_next_op_local_idx = job_next_op_local_idx + one_hot * step_active
+                mask_job_finished = (job_next_op_local_idx >= job_length)
 
-            job_ready_time.scatter_(1, sel_job_unsq, actual_comp.unsqueeze(1))
-            machine_avail_time.scatter_(1, selected_mach.unsqueeze(1), actual_comp.unsqueeze(1))
+                sel_mach_expanded = selected_mach.unsqueeze(1).unsqueeze(-1).expand(-1, -1, self.hidden_dim)
+                selected_mach_emb = torch.gather(mach_dense, 1, sel_mach_expanded).squeeze(1)  # [B, hidden_dim]
+                combined_context = torch.cat([selected_op_emb, selected_mach_emb], dim=-1)
 
-            one_hot = F.one_hot(selected_job, num_classes=n_j)  # [B, n_j]
-            step_active = (~batch_is_done).unsqueeze(-1).long()
-            job_next_op_local_idx = job_next_op_local_idx + one_hot * step_active
-            mask_job_finished = (job_next_op_local_idx >= job_length)
+                curr_input = self.context_proj(combined_context)
+        priority_job_list = torch.stack(actions_job_list, dim=1)
+        machine_assign_tensor = torch.stack(actions_mach_list, dim=1)
 
-            sel_mach_expanded = selected_mach.unsqueeze(1).unsqueeze(-1).expand(-1, -1, self.hidden_dim)
-            selected_mach_emb = torch.gather(mach_dense, 1, sel_mach_expanded).squeeze(1)  # [B, hidden_dim]
-            combined_context = torch.cat([selected_op_emb, selected_mach_emb], dim=-1)
-
-            curr_input = self.context_proj(combined_context)
-        priority_job_list = torch.stack(job_indices_seq, dim=1)
-        machine_assign_tensor = torch.stack(machine_assign_list, dim=1)
-
-        if not rollout:
-            # RL联合概率 = 工序概率 + 机器概率
-            sum_log_probs = torch.stack(log_probs_op, dim=1).sum(dim=1) + torch.stack(log_probs_mach, dim=1).sum(dim=1)
-            sum_entropy = torch.stack(entropy_op, dim=1).sum(dim=1) + torch.stack(entropy_mach, dim=1).sum(dim=1)
-            return priority_job_list, machine_assign_tensor, sum_log_probs, sum_entropy
-        else:
+        if rollout:
             return priority_job_list, machine_assign_tensor, None, None
+
+        T = priority_job_list.size(1)
+
+        sel_node_idx_tensor = torch.stack(sel_node_idx_list, dim=1).squeeze(2)  # [B, T]
+        safe_indices_tensor = torch.stack(safe_indices_list, dim=1)  # [B, T, n_j]
+        dyn_feats_tensor = torch.stack(dyn_feats_list, dim=1)  # [B, T, n_j, 7]
+        mask_job_finished_tensor = torch.stack(mask_job_finished_list, dim=1)  # [B, T, n_j]
+        batch_is_done_tensor = torch.stack(batch_is_done_list, dim=1)  # [B, T]
+        curr_op_mach_compat_tensor = torch.stack(curr_op_mach_compat_list, dim=1)  # [B, T, n_m]
+        k_mach_dyn_tensor = torch.stack(k_mach_dyn_list, dim=1)  # [B, T, n_m, 4]
+
+        # 还原并重构整个序列 GPT 输入
+        selected_op_emb_seq = torch.gather(encoder_out, 1,
+                                           sel_node_idx_tensor.unsqueeze(-1).expand(-1, -1, self.hidden_dim))
+        selected_mach_emb_seq = torch.gather(mach_dense, 1,
+                                             machine_assign_tensor.unsqueeze(-1).expand(-1, -1, self.hidden_dim))
+
+        combined_context_seq = torch.cat([selected_op_emb_seq, selected_mach_emb_seq], dim=-1)  # [B, T, 2H]
+        curr_input_from_actions = self.context_proj(combined_context_seq)  # [B, T, H]
+
+        # 序列构建: [初始 token, action_1 token, ..., action_T-1 token]
+        curr_input_0 = (graph_context + self.start_token.expand(bsz, -1)).unsqueeze(1)  # [B, 1, H]
+        x_seq_full = torch.cat([curr_input_0, curr_input_from_actions[:, :-1, :]], dim=1)  # [B, T, H]
+
+        pos = torch.arange(0, T, dtype=torch.long, device=device)
+        pos_emb = self.wpe(pos)
+        x = self.drop(x_seq_full + pos_emb.unsqueeze(0))
+        for block in self.h:
+            x = block(x)
+        hx_seq = self.ln_f(x)
+
+        #  并行计算所有的工序(Job) 指针网络
+        q_op_seq = hx_seq  # [B, T, H]
+        glimpse_op_seq = self.op_pointer_att(q=q_op_seq, k=encoder_out, v=encoder_out, mask=mask_padding)
+
+        k_candidates_seq = torch.gather(k_logits_all.unsqueeze(1).expand(-1, T, -1, -1), 2,
+                                        safe_indices_tensor.unsqueeze(-1).expand(-1, -1, -1, self.hidden_dim))
+        cat_feats_seq = torch.cat([k_candidates_seq, dyn_feats_tensor], dim=-1)
+        k_candidates_fused_seq = self.fusion_net(cat_feats_seq)
+
+        # einsum 矩阵乘法替代
+        glimpse_op_unsq = glimpse_op_seq.unsqueeze(2)  # [B, T, 1, H]
+        u_op_seq = torch.matmul(glimpse_op_unsq, k_candidates_fused_seq.transpose(-2, -1)) / (self.hidden_dim ** 0.5)
+        u_op_seq = torch.tanh(u_op_seq) * self.tanh_clipping / temperature
+        u_op_seq = u_op_seq.squeeze(2)  # [B, T, n_j]
+
+        u_op_seq = u_op_seq.masked_fill(mask_job_finished_tensor, float('-inf'))
+        u_op_safe_seq = u_op_seq.masked_fill(batch_is_done_tensor.unsqueeze(-1), 0.0)
+        u_op_safe_seq = u_op_safe_seq.masked_fill(mask_job_finished_tensor & ~batch_is_done_tensor.unsqueeze(-1),
+                                                  float('-inf'))
+
+        m_op_seq = Categorical(probs=F.softmax(u_op_safe_seq, dim=-1))
+        # 记录对数概率
+        log_probs_op_seq = m_op_seq.log_prob(priority_job_list) * (~batch_is_done_tensor).float()
+        entropy_op_seq = m_op_seq.entropy() * (~batch_is_done_tensor).float()
+
+        # 并行计算所有的机器(Machine) 指针网络
+        q_mach_raw_seq = torch.cat([hx_seq, selected_op_emb_seq], dim=-1)
+        q_mach_seq = self.q_mach_proj(q_mach_raw_seq)  # [B, T, H]
+
+        base_k_mach_seq = mach_dense.unsqueeze(1).expand(-1, T, -1, -1)
+        k_mach_concat_seq = torch.cat([base_k_mach_seq, k_mach_dyn_tensor], dim=-1)
+        k_mach_seq = self.dyn_mach_proj(k_mach_concat_seq)  # [B, T, n_m, H]
+
+        q_mach_flat = q_mach_seq.view(bsz * T, 1, self.hidden_dim)  # [B*T, 1, H]
+        k_mach_flat = k_mach_seq.view(bsz * T, n_m, self.hidden_dim)  # [B*T, n_m, H]
+        glimpse_mach_flat = self.mach_pointer_att(q=q_mach_flat, k=k_mach_flat, v=k_mach_flat)
+        glimpse_mach_seq = glimpse_mach_flat.view(bsz, T, self.hidden_dim)  # 还原回 [B, T, H]
+
+        glimpse_mach_unsq = glimpse_mach_seq.unsqueeze(2)  # [B, T, 1, H]
+        u_mach_seq = torch.matmul(glimpse_mach_unsq, k_mach_seq.transpose(-2, -1)) / (self.hidden_dim ** 0.5)
+        u_mach_seq = u_mach_seq.squeeze(2)  # [B, T, n_m]
+
+        u_mach_safe_seq = u_mach_seq.masked_fill(batch_is_done_tensor.unsqueeze(-1), 0.0)
+        u_mach_safe_seq = u_mach_safe_seq.masked_fill(~curr_op_mach_compat_tensor & ~batch_is_done_tensor.unsqueeze(-1),
+                                                      float('-inf'))
+
+        m_mach_seq = Categorical(probs=F.softmax(u_mach_safe_seq, dim=-1))
+        # 记录机器的对数概率
+        log_probs_mach_seq = m_mach_seq.log_prob(machine_assign_tensor) * (~batch_is_done_tensor).float()
+        entropy_mach_seq = m_mach_seq.entropy() * (~batch_is_done_tensor).float()
+
+        # 直接聚合求解
+        sum_log_probs = log_probs_op_seq.sum(dim=1) + log_probs_mach_seq.sum(dim=1)
+        sum_entropy = entropy_op_seq.sum(dim=1) + entropy_mach_seq.sum(dim=1)
+
+        return priority_job_list, machine_assign_tensor, sum_log_probs, sum_entropy
 
 
 class FJSPActor(nn.Module):

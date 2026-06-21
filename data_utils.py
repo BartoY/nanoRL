@@ -137,7 +137,7 @@ def convert_to_pyg_data(adj_conj, fea, mach_fea, proc_times, compat_mask, n_m, j
 
 
 def _generate_single_instance(idx, n_j, n_m, min_op, max_op, return_pyg=False):
-    proc_times, compat_mask, job_length = uni_instance_gen(n_j, n_m, min_op, max_op, 0.01, 1.0, 0.5)
+    proc_times, compat_mask, job_length = uni_instance_gen(n_j, n_m, min_op, max_op, 0.01, 1.0)
 
     adj, fea, mach_fea = get_initial_input(n_j, n_m, max_op, proc_times, compat_mask, job_length)
     if return_pyg:
