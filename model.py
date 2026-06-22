@@ -359,8 +359,9 @@ class GPTDecoder(nn.Module):
                 if rollout:
                     selected_job = u_op_safe.max(-1)[1]
                 else:
-                    probs = F.softmax(u_op_safe, dim=-1)
-                    selected_job = Categorical(probs).sample()
+                    # probs = F.softmax(u_op_safe, dim=-1)
+                    # selected_job = Categorical(probs).sample()
+                    selected_job = Categorical(logits=u_op_safe).sample()
                     # 只记录有效 batch 的对数概率和熵
 
                 selected_job = selected_job.masked_fill(batch_is_done, 0)
@@ -420,7 +421,8 @@ class GPTDecoder(nn.Module):
                 if rollout:
                     selected_mach = u_mach_safe.max(-1)[1]
                 else:
-                    selected_mach = Categorical(F.softmax(u_mach_safe, dim=-1)).sample()
+                    # selected_mach = Categorical(F.softmax(u_mach_safe, dim=-1)).sample()
+                    selected_mach = Categorical(logits=u_mach_safe).sample()
                 selected_mach = selected_mach.masked_fill(batch_is_done, 0)
                 actions_mach_list.append(selected_mach)
 
@@ -503,7 +505,8 @@ class GPTDecoder(nn.Module):
         u_op_safe_seq = u_op_safe_seq.masked_fill(mask_job_finished_tensor & ~batch_is_done_tensor.unsqueeze(-1),
                                                   float('-inf'))
 
-        m_op_seq = Categorical(probs=F.softmax(u_op_safe_seq, dim=-1))
+        # m_op_seq = Categorical(probs=F.softmax(u_op_safe_seq, dim=-1))
+        m_op_seq = Categorical(logits=u_op_safe_seq)
         # 记录对数概率
         log_probs_op_seq = m_op_seq.log_prob(priority_job_list) * (~batch_is_done_tensor).float()
         entropy_op_seq = m_op_seq.entropy() * (~batch_is_done_tensor).float()
@@ -529,7 +532,8 @@ class GPTDecoder(nn.Module):
         u_mach_safe_seq = u_mach_safe_seq.masked_fill(~curr_op_mach_compat_tensor & ~batch_is_done_tensor.unsqueeze(-1),
                                                       float('-inf'))
 
-        m_mach_seq = Categorical(probs=F.softmax(u_mach_safe_seq, dim=-1))
+        # m_mach_seq = Categorical(probs=F.softmax(u_mach_safe_seq, dim=-1))
+        m_mach_seq = Categorical(logits=u_mach_safe_seq)
         # 记录机器的对数概率
         log_probs_mach_seq = m_mach_seq.log_prob(machine_assign_tensor) * (~batch_is_done_tensor).float()
         entropy_mach_seq = m_mach_seq.entropy() * (~batch_is_done_tensor).float()
