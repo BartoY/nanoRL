@@ -28,8 +28,8 @@ N_M = 5
 MIN_OP = int(N_M * 0.8)
 MAX_OP = int(N_M * 1.2)
 n_simple = 1024000
-ENTROPY_COEF = 0.01   # 熵正则化系数
-TEMP_START = 1.5     # 初始温度
+ENTROPY_COEF = 0.001   # 熵正则化系数
+TEMP_START = 1.2     # 初始温度
 TEMP_END = 1.0
 
 
