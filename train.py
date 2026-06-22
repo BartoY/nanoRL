@@ -140,8 +140,8 @@ def main():
                     advantage = (costs - base_costs).detach()
 
                 # Advantage归一化
-                # if advantage.numel() > 1:
-                #     advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
+                if advantage.numel() > 1:
+                    advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
 
                 rl_loss = (advantage * log_probs).mean()
 
