@@ -20,15 +20,15 @@ import wandb
 # --- 超参数 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # DEVICE = torch.device("cpu")
-LR = 1e-5
-BATCH_SIZE = 1024
+LR = 1e-4
+BATCH_SIZE = 1280
 EPOCHS = 30
 N_J = 10
 N_M = 5
 MIN_OP = int(N_M * 0.8)
 MAX_OP = int(N_M * 1.2)
 n_simple = 1024000
-ENTROPY_COEF = 0.005   # 熵正则化系数
+ENTROPY_COEF = 0   # 熵正则化系数
 TEMP_START = 1.0     # 初始温度
 TEMP_END = 1.0
 
