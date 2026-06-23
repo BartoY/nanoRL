@@ -28,7 +28,7 @@ N_M = 5
 MIN_OP = int(N_M * 0.8)
 MAX_OP = int(N_M * 1.2)
 n_simple = 1024000
-ENTROPY_COEF = 0   # 熵正则化系数
+ENTROPY_COEF = 0.005   # 熵正则化系数
 TEMP_START = 1.0     # 初始温度
 TEMP_END = 1.0
 
@@ -140,8 +140,8 @@ def main():
                     advantage = (costs - base_costs).detach()
 
                 # Advantage归一化
-                # if advantage.numel() > 1:
-                #     advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
+                if advantage.numel() > 1:
+                    advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
 
                 rl_loss = (advantage * log_probs).mean()
 
