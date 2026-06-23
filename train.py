@@ -21,7 +21,7 @@ import wandb
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # DEVICE = torch.device("cpu")
 LR = 5e-5
-BATCH_SIZE = 1024
+BATCH_SIZE = 512
 EPOCHS = 30
 N_J = 10
 N_M = 5
