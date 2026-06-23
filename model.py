@@ -573,10 +573,10 @@ class FJSPActor(nn.Module):
         op_emb_flat = node_emb_dict['operation']
         mach_emb_flat = node_emb_dict['machine']
 
-        x_op_dense, mask_op = to_dense_batch(op_emb_flat, pyg_hetero_batch['operation'].batch)
+        x_op_dense, mask_op = to_dense_batch(op_emb_flat, pyg_hetero_batch['operation'].batch,max_num_nodes=op_proc_time.size(1))
         mask_padding = ~mask_op
 
-        x_mach_dense, _ = to_dense_batch(mach_emb_flat, pyg_hetero_batch['machine'].batch)
+        x_mach_dense, _ = to_dense_batch(mach_emb_flat, pyg_hetero_batch['machine'].batch, max_num_nodes=op_proc_time.size(2))
 
         # 解码
         return self.decoder(x_op_dense, x_mach_dense, mask_padding, mask_machine_compat,
