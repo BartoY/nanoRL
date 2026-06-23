@@ -20,17 +20,17 @@ import wandb
 # --- 超参数 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # DEVICE = torch.device("cpu")
-LR = 1e-4
-BATCH_SIZE = 1280
+LR = 5e-5
+BATCH_SIZE = 1024
 EPOCHS = 30
 N_J = 10
 N_M = 5
 MIN_OP = int(N_M * 0.8)
 MAX_OP = int(N_M * 1.2)
 n_simple = 1024000
-ENTROPY_COEF = 0   # 熵正则化系数
-TEMP_START = 1.0     # 初始温度
-TEMP_END = 1.0
+ENTROPY_COEF = 0.01   # 熵正则化系数
+TEMP_START = 1.2     # 初始温度
+TEMP_END = 0.8
 
 
 def main():
@@ -43,7 +43,7 @@ def main():
     dummy_data = _generate_single_instance(0, N_J, N_M, MIN_OP, MAX_OP, return_pyg=True)
     metadata = dummy_data.metadata()
     # 初始化模型
-    policy_model = FJSPActor(op_input_dim=6, mach_input_dim=3, hidden_dim=256, metadata=metadata, n_layers=6, n_heads=8).to(DEVICE)
+    policy_model = FJSPActor(op_input_dim=6, mach_input_dim=3, hidden_dim=768, metadata=metadata, n_layers=12, n_heads=12).to(DEVICE)
     baseline_model = deepcopy(policy_model)
     baseline_model.eval()
 
@@ -141,8 +141,8 @@ def main():
 
                 # Advantage归一化
                 if advantage.numel() > 1:
-                    advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
-
+                    # advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
+                    advantage = advantage / (advantage.std(unbiased=False) + 1e-8)
                 rl_loss = (advantage * log_probs).mean()
 
                 entropy_bonus = entropy.mean() * ENTROPY_COEF
