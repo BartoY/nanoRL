@@ -262,6 +262,7 @@ class GPTDecoder(nn.Module):
         actions_job_list = []
         actions_mach_list = []
 
+        # 并行梯度所需的轨迹缓存
         sel_node_idx_list = []
         safe_indices_list = []
         dyn_feats_list = []
@@ -270,14 +271,15 @@ class GPTDecoder(nn.Module):
         curr_op_mach_compat_list = []
         k_mach_dyn_list = []
 
-        seq_inputs = []
-
-        with torch.no_grad() if not rollout else contextlib.nullcontext():
+        # =========================================================
+        # 第一阶段：无梯度采样，释放自回归过程中的激活值显存
+        # =========================================================
+        with torch.no_grad():
             for i in range(max_steps):
                 # 将当前的 input 存入序列
                 seq_inputs.append(curr_input)   # list of [B, H]
 
-                # 将历史记录拼接成[B, T, H]
+                # 将历史记录拼接成 [B, T_curr, H]
                 x_seq = torch.stack(seq_inputs, dim=1)
                 T_curr = x_seq.size(1)
 
@@ -285,7 +287,7 @@ class GPTDecoder(nn.Module):
                 pos = torch.arange(0, T_curr, dtype=torch.long, device=device)  # [T]
                 pos_emb = self.wpe(pos)  # [T, H]
 
-                # 输入 GPT
+                # 输入 GPT Block
                 x = self.drop(x_seq + pos_emb)
                 for block in self.h:
                     x = block(x)
@@ -296,13 +298,12 @@ class GPTDecoder(nn.Module):
 
                 current_global_indices = base_indices + job_next_op_local_idx
                 safe_indices = current_global_indices.clamp(max=n_node - 1)
-                safe_indices_list.append(safe_indices)  # [Cache]
 
                 # k_logits_all: [B, N_tasks, H] -> [B, n_j, H]
                 safe_indices_expanded = safe_indices.unsqueeze(-1).expand(-1, -1, self.hidden_dim)
                 k_candidates = torch.gather(k_logits_all, 1, safe_indices_expanded)
 
-                # 当前候选工序的机器兼容矩阵
+                # 当前候选工序的机器兼容矩阵与时间计算
                 cand_pt_est = torch.gather(avg_op_pt, 1, safe_indices)
                 cand_mach_mask = torch.gather(mask_machine_compat, 1, safe_indices.unsqueeze(-1).expand(-1, -1, n_m))
                 avail_time_expanded = machine_avail_time.unsqueeze(1).expand(-1, n_j, -1)
@@ -320,7 +321,7 @@ class GPTDecoder(nn.Module):
                 job_progress = 1.0 - ops_left_ratio.float()
                 valid_job_mask = (job_length > 0).float()
                 mean_progress = (job_progress * valid_job_mask).sum(dim=1, keepdim=True) / \
-                                valid_job_mask.sum(dim=1,keepdim=True).clamp(min=1.0)
+                                valid_job_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
                 progress_diff = job_progress - mean_progress  # [B, n_j]
 
                 norm_factor = torch.max(machine_avail_time, dim=1, keepdim=True)[0].clamp(min=1.0)
@@ -333,46 +334,39 @@ class GPTDecoder(nn.Module):
                     pt_ratio,
                     progress_diff
                 ], dim=-1)  # [B, n_j, 7]
-                dyn_feats_list.append(dyn_feats)  # [Cache]
 
                 cat_feats = torch.cat([k_candidates, dyn_feats], dim=-1)
                 k_candidates_fused = self.fusion_net(cat_feats)  # [B, n_j, H]
 
-                # ---计算 Logits---
+                # --- 计算工序选择 Logits ---
                 u_op = torch.matmul(glimpse_op, k_candidates_fused.transpose(-2, -1)) / (self.hidden_dim ** 0.5)
                 u_op = torch.tanh(u_op) * self.tanh_clipping / temperature
                 u_op = u_op.squeeze(1)
 
                 batch_is_done = mask_job_finished.all(dim=-1)  # [B]
-                batch_is_done_list.append(batch_is_done)  # [Cache]
 
                 is_all_masked = mask_job_finished.all(dim=-1, keepdim=True)
-                mask_job_finished = mask_job_finished.masked_fill(is_all_masked, False)
-                mask_job_finished_list.append(mask_job_finished)  # [Cache]
+                # 显式克隆 mask 避免修改引用
+                mask_job_finished_temp = mask_job_finished.clone()
+                mask_job_finished_temp = mask_job_finished_temp.masked_fill(is_all_masked, False)
 
-                # ---Mask掉已完成的Job---
-                u_op = u_op.masked_fill(mask_job_finished, float('-inf'))
+                # --- Mask 掉已完成的 Job ---
+                u_op = u_op.masked_fill(mask_job_finished_temp, float('-inf'))
                 u_op_safe = u_op.masked_fill(batch_is_done.unsqueeze(-1), 0.0)
-                u_op_safe = u_op_safe.masked_fill(mask_job_finished & ~batch_is_done.unsqueeze(-1), float('-inf'))
+                u_op_safe = u_op_safe.masked_fill(mask_job_finished_temp & ~batch_is_done.unsqueeze(-1), float('-inf'))
 
-                # 采样/贪婪选择
+                # 采样 / 贪婪
                 if rollout:
                     selected_job = u_op_safe.max(-1)[1]
                 else:
-                    # probs = F.softmax(u_op_safe, dim=-1)
-                    # selected_job = Categorical(probs).sample()
                     selected_job = Categorical(logits=u_op_safe).sample()
-                    # 只记录有效 batch 的对数概率和熵
 
                 selected_job = selected_job.masked_fill(batch_is_done, 0)
                 actions_job_list.append(selected_job)
 
-                # ---------------------------------------------------------
                 # Low-Level: 为选出的工序分配机器
-                # ---------------------------------------------------------
                 sel_job_unsq = selected_job.unsqueeze(1)
                 sel_node_idx = torch.gather(current_global_indices, 1, sel_job_unsq)
-                sel_node_idx_list.append(sel_node_idx)  # [Cache]
 
                 idx_exp = sel_node_idx.unsqueeze(-1)
                 selected_op_emb = torch.gather(encoder_out, 1,
@@ -382,13 +376,11 @@ class GPTDecoder(nn.Module):
                 q_mach_raw = torch.cat([hx, selected_op_emb], dim=-1)
                 q_mach = self.q_mach_proj(q_mach_raw).unsqueeze(1)
 
-                # base_k_mach = self.machine_embeds.expand(bsz, -1, -1)
-                # base_k_mach = mach_dense  # [B, n_m, H]
+                base_k_mach = mach_dense  # [B, n_m, H]
 
                 curr_op_mach_compat = torch.gather(
                     mask_machine_compat, 1, idx_exp.expand(-1, -1, n_m)
                 ).squeeze(1)
-                curr_op_mach_compat_list.append(curr_op_mach_compat)  # [Cache]
 
                 curr_op_pt = torch.gather(op_proc_time, 1, idx_exp.expand(-1, -1, n_m)).squeeze(1)
                 curr_op_pt = curr_op_pt.masked_fill(~curr_op_mach_compat, 0.0)
@@ -404,13 +396,12 @@ class GPTDecoder(nn.Module):
                 norm_est_comp = (est_comp_on_mach / max_avail).unsqueeze(-1)  # 最终完工时间[B, n_m, 1]
                 mach_idle_relative = ((max_avail - machine_avail_time) / max_avail).unsqueeze(-1)
 
+                # 拼接机器动力学特征
                 k_mach_dyn = torch.cat([norm_mach_avail, norm_curr_op_pt, norm_est_comp, mach_idle_relative], dim=-1)
-                k_mach_dyn_list.append(k_mach_dyn)  # [Cache]
-
-                k_mach_concat = torch.cat([mach_dense, k_mach_dyn], dim=-1)
+                k_mach_concat = torch.cat([base_k_mach, k_mach_dyn], dim=-1)
                 k_mach = self.dyn_mach_proj(k_mach_concat)
 
-                # 底层 Glimpse 和 Logits
+                # 底层指针评估
                 glimpse_mach = self.mach_pointer_att(q=q_mach, k=k_mach, v=k_mach)
                 u_mach = torch.matmul(glimpse_mach, k_mach.transpose(-2, -1)) / (self.hidden_dim ** 0.5)
                 u_mach = u_mach.squeeze(1)  # [B, n_m]
@@ -421,11 +412,21 @@ class GPTDecoder(nn.Module):
                 if rollout:
                     selected_mach = u_mach_safe.max(-1)[1]
                 else:
-                    # selected_mach = Categorical(F.softmax(u_mach_safe, dim=-1)).sample()
                     selected_mach = Categorical(logits=u_mach_safe).sample()
                 selected_mach = selected_mach.masked_fill(batch_is_done, 0)
                 actions_mach_list.append(selected_mach)
 
+                # 为训练阶段缓存中间计算状态 (非 rollout 时才会需要并行重构)
+                if not rollout:
+                    sel_node_idx_list.append(sel_node_idx)
+                    safe_indices_list.append(safe_indices)
+                    dyn_feats_list.append(dyn_feats)
+                    mask_job_finished_list.append(mask_job_finished_temp)
+                    batch_is_done_list.append(batch_is_done)
+                    curr_op_mach_compat_list.append(curr_op_mach_compat)
+                    k_mach_dyn_list.append(k_mach_dyn)
+
+                # 更新排程状态
                 batch_idx = torch.arange(bsz, device=device)
                 chosen_pt = op_proc_time[batch_idx, sel_node_idx.squeeze(1), selected_mach]  # [B]
 
@@ -449,12 +450,19 @@ class GPTDecoder(nn.Module):
                 combined_context = torch.cat([selected_op_emb, selected_mach_emb], dim=-1)
 
                 curr_input = self.context_proj(combined_context)
+
         priority_job_list = torch.stack(actions_job_list, dim=1)
         machine_assign_tensor = torch.stack(actions_mach_list, dim=1)
 
+        # ---------------------------------------------------------
+        # 验证/推理直接返回结果，彻底避免梯度计算图开销
+        # ---------------------------------------------------------
         if rollout:
             return priority_job_list, machine_assign_tensor, None, None
 
+        # =========================================================
+        # 第二阶段：并行重构，利用 nanoGPT 的自回归特征单次并向传播计算 Loss
+        # =========================================================
         T = priority_job_list.size(1)
 
         sel_node_idx_tensor = torch.stack(sel_node_idx_list, dim=1).squeeze(2)  # [B, T]
@@ -465,7 +473,7 @@ class GPTDecoder(nn.Module):
         curr_op_mach_compat_tensor = torch.stack(curr_op_mach_compat_list, dim=1)  # [B, T, n_m]
         k_mach_dyn_tensor = torch.stack(k_mach_dyn_list, dim=1)  # [B, T, n_m, 4]
 
-        # 还原并重构整个序列 GPT 输入
+        # 重构并对齐历史序列的 Embedding
         selected_op_emb_seq = torch.gather(encoder_out, 1,
                                            sel_node_idx_tensor.unsqueeze(-1).expand(-1, -1, self.hidden_dim))
         selected_mach_emb_seq = torch.gather(mach_dense, 1,
@@ -474,18 +482,19 @@ class GPTDecoder(nn.Module):
         combined_context_seq = torch.cat([selected_op_emb_seq, selected_mach_emb_seq], dim=-1)  # [B, T, 2H]
         curr_input_from_actions = self.context_proj(combined_context_seq)  # [B, T, H]
 
-        # 序列构建: [初始 token, action_1 token, ..., action_T-1 token]
+        # 序列自回归偏移对齐: [初始特征, 动作1反馈, ..., 动作T-1反馈]
         curr_input_0 = (graph_context + self.start_token.expand(bsz, -1)).unsqueeze(1)  # [B, 1, H]
         x_seq_full = torch.cat([curr_input_0, curr_input_from_actions[:, :-1, :]], dim=1)  # [B, T, H]
 
+        # 仅执行一次并行的多层自注意力运算
         pos = torch.arange(0, T, dtype=torch.long, device=device)
         pos_emb = self.wpe(pos)
         x = self.drop(x_seq_full + pos_emb.unsqueeze(0))
         for block in self.h:
             x = block(x)
-        hx_seq = self.ln_f(x)
+        hx_seq = self.ln_f(x)  # [B, T, H]
 
-        #  并行计算所有的工序(Job) 指针网络
+        # --- 并行计算工序指针网络对数概率与熵 ---
         q_op_seq = hx_seq  # [B, T, H]
         glimpse_op_seq = self.op_pointer_att(q=q_op_seq, k=encoder_out, v=encoder_out, mask=mask_padding)
 
@@ -494,7 +503,6 @@ class GPTDecoder(nn.Module):
         cat_feats_seq = torch.cat([k_candidates_seq, dyn_feats_tensor], dim=-1)
         k_candidates_fused_seq = self.fusion_net(cat_feats_seq)
 
-        # einsum 矩阵乘法替代
         glimpse_op_unsq = glimpse_op_seq.unsqueeze(2)  # [B, T, 1, H]
         u_op_seq = torch.matmul(glimpse_op_unsq, k_candidates_fused_seq.transpose(-2, -1)) / (self.hidden_dim ** 0.5)
         u_op_seq = torch.tanh(u_op_seq) * self.tanh_clipping / temperature
@@ -505,13 +513,11 @@ class GPTDecoder(nn.Module):
         u_op_safe_seq = u_op_safe_seq.masked_fill(mask_job_finished_tensor & ~batch_is_done_tensor.unsqueeze(-1),
                                                   float('-inf'))
 
-        # m_op_seq = Categorical(probs=F.softmax(u_op_safe_seq, dim=-1))
         m_op_seq = Categorical(logits=u_op_safe_seq)
-        # 记录对数概率
         log_probs_op_seq = m_op_seq.log_prob(priority_job_list) * (~batch_is_done_tensor).float()
         entropy_op_seq = m_op_seq.entropy() * (~batch_is_done_tensor).float()
 
-        # 并行计算所有的机器(Machine) 指针网络
+        # --- 并行计算机器指针网络对数概率与熵 ---
         q_mach_raw_seq = torch.cat([hx_seq, selected_op_emb_seq], dim=-1)
         q_mach_seq = self.q_mach_proj(q_mach_raw_seq)  # [B, T, H]
 
@@ -519,6 +525,7 @@ class GPTDecoder(nn.Module):
         k_mach_concat_seq = torch.cat([base_k_mach_seq, k_mach_dyn_tensor], dim=-1)
         k_mach_seq = self.dyn_mach_proj(k_mach_concat_seq)  # [B, T, n_m, H]
 
+        # 扁平化以高效应用 Attention
         q_mach_flat = q_mach_seq.view(bsz * T, 1, self.hidden_dim)  # [B*T, 1, H]
         k_mach_flat = k_mach_seq.view(bsz * T, n_m, self.hidden_dim)  # [B*T, n_m, H]
         glimpse_mach_flat = self.mach_pointer_att(q=q_mach_flat, k=k_mach_flat, v=k_mach_flat)
@@ -532,13 +539,11 @@ class GPTDecoder(nn.Module):
         u_mach_safe_seq = u_mach_safe_seq.masked_fill(~curr_op_mach_compat_tensor & ~batch_is_done_tensor.unsqueeze(-1),
                                                       float('-inf'))
 
-        # m_mach_seq = Categorical(probs=F.softmax(u_mach_safe_seq, dim=-1))
         m_mach_seq = Categorical(logits=u_mach_safe_seq)
-        # 记录机器的对数概率
         log_probs_mach_seq = m_mach_seq.log_prob(machine_assign_tensor) * (~batch_is_done_tensor).float()
         entropy_mach_seq = m_mach_seq.entropy() * (~batch_is_done_tensor).float()
 
-        # 直接聚合求解
+        # 并行聚合并求解最终指标
         sum_log_probs = log_probs_op_seq.sum(dim=1) + log_probs_mach_seq.sum(dim=1)
         sum_entropy = entropy_op_seq.sum(dim=1) + entropy_mach_seq.sum(dim=1)
 
@@ -560,7 +565,6 @@ class FJSPActor(nn.Module):
         pyg_batch: torch_geometric.data.Batch
         """
         # 图编码
-        # node_emb_flat = self.encoder(pyg_batch.x, pyg_batch.edge_index, pyg_batch.edge_attr)
         x_dict = {
             'operation': self.op_emb(pyg_hetero_batch['operation'].x),
             'machine': self.mach_emb(pyg_hetero_batch['machine'].x)
@@ -573,10 +577,21 @@ class FJSPActor(nn.Module):
         op_emb_flat = node_emb_dict['operation']
         mach_emb_flat = node_emb_dict['machine']
 
-        x_op_dense, mask_op = to_dense_batch(op_emb_flat, pyg_hetero_batch['operation'].batch,max_num_nodes=op_proc_time.size(1))
+        # =========================================================
+        # 通过强制传入物理尺寸对齐，解决动态维度裁剪 bug
+        # =========================================================
+        x_op_dense, mask_op = to_dense_batch(
+            op_emb_flat,
+            pyg_hetero_batch['operation'].batch,
+            max_num_nodes=op_proc_time.size(1)  # 强制对齐到 N_J * MAX_OP (如 60)
+        )
         mask_padding = ~mask_op
 
-        x_mach_dense, _ = to_dense_batch(mach_emb_flat, pyg_hetero_batch['machine'].batch, max_num_nodes=op_proc_time.size(2))
+        x_mach_dense, _ = to_dense_batch(
+            mach_emb_flat,
+            pyg_hetero_batch['machine'].batch,
+            max_num_nodes=op_proc_time.size(2)  # 强制对齐到 N_M (如 5)
+        )
 
         # 解码
         return self.decoder(x_op_dense, x_mach_dense, mask_padding, mask_machine_compat,
