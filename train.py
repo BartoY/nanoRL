@@ -20,7 +20,7 @@ import wandb
 # --- 超参数 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LR = 3e-4
-BATCH_SIZE = 256
+BATCH_SIZE = 192
 EPOCHS = 30
 N_J = 15
 N_M = 10
