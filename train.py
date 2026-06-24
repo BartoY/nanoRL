@@ -17,16 +17,13 @@ from data_utils import epoch_dataset_gen, _generate_single_instance
 from validate import validate_model
 import wandb
 
-# os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
-
 # --- 超参数 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# DEVICE = torch.device("cpu")
-MAX_LR = 3e-4  # [修改] 配合 OneCycleLR 的最大学习率，替代固定的小 LR
-BATCH_SIZE = 256
-EPOCHS = 10  # [建议] 数据量如此之大，实际上不需要30个Epoch，这里建议改小，10已经非常充分
-N_J = 10
-N_M = 5
+MAX_LR = 3e-4
+BATCH_SIZE = 64
+EPOCHS = 30
+N_J = 15
+N_M = 10
 MIN_OP = int(N_M * 0.8)
 MAX_OP = int(N_M * 1.2)
 n_simple = 1024000
