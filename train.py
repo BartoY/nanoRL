@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import math
 import random
 import torch
 import torch.optim as optim
@@ -12,25 +13,25 @@ from torch.amp import GradScaler, autocast
 from model import FJSPActor
 from utils import fjsp_sched_bch, chk_upd_bl
 from plot import plot_learning_curves
-from data_utils import epoch_dataset_gen, _generate_single_instance
+from data_utils import epoch_dataset_gen, _generate_single_instance, DynamicFJSPDataset
 from validate import validate_model
 import wandb
-# os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 
 # --- 超参数 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# DEVICE = torch.device("cpu")
-LR = 5e-5
+LR = 3e-4
 BATCH_SIZE = 256
 EPOCHS = 30
-N_J = 10
-N_M = 5
+N_J = 15
+N_M = 10
 MIN_OP = int(N_M * 0.8)
 MAX_OP = int(N_M * 1.2)
-n_simple = 1024000
+n_simple = 10240
 ENTROPY_COEF = 0.01   # 熵正则化系数
 TEMP_START = 1.2     # 初始温度
 TEMP_END = 0.8
+
+VAL_FREQ = 500
 
 
 def main():
@@ -47,11 +48,27 @@ def main():
     baseline_model = deepcopy(policy_model)
     baseline_model.eval()
 
-    policy_model = DDP(policy_model, device_ids=[local_rank], output_device=local_rank,find_unused_parameters=True)
+    policy_model = DDP(policy_model, device_ids=[local_rank], output_device=local_rank,find_unused_parameters=False)
 
-    optimizer = optim.Adam(policy_model.parameters(), lr=LR)
+    optimizer = optim.AdamW(policy_model.parameters(), lr=LR, weight_decay=1e-4)
     scaler = GradScaler('cuda')
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+    # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+
+    world_size = dist.get_world_size()
+    local_n_simple = n_simple // world_size
+    steps_per_epoch = math.ceil(local_n_simple / BATCH_SIZE)
+    total_steps = steps_per_epoch * EPOCHS
+
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=LR,
+        total_steps=total_steps,
+        pct_start=0.05,  # 前 5% 的 Step 用于预热(Warmup)
+        anneal_strategy='cos',  # 余弦平滑衰减
+        div_factor=10.0,  # 初始LR = MAX_LR / 10
+        final_div_factor=100.0  # 最终LR = 初始LR / 100
+    )
+
     if local_rank == 0:
         # 1. 初始化 wandb，记录超参数
         wandb.init(
@@ -66,9 +83,8 @@ def main():
                 "n_m": N_M
             }
         )
-    # 验证集
-    if local_rank == 0:
-        val_data_list = epoch_dataset_gen(n_samples=1024, n_j=N_J, n_m=N_M, min_op=MIN_OP, max_op=MAX_OP)
+
+        val_data_list = epoch_dataset_gen(n_samples=512, n_j=N_J, n_m=N_M, min_op=MIN_OP, max_op=MAX_OP)
         val_loader = DataLoader(val_data_list, batch_size=BATCH_SIZE, shuffle=False)
         print("Evaluating initial baseline...")
         baseline_val_costs = validate_model(baseline_model, val_loader, DEVICE, N_J, N_M, MAX_OP)
@@ -78,25 +94,28 @@ def main():
         history_train_mksp = []
         history_val_mksp = []
         best_val_makespan = float('inf')
-
-    world_size = dist.get_world_size()
-    local_n_simple = n_simple // world_size
     dist.barrier()
+
+    global_step = 0
+
+    running_loss = 0.0
+    running_train_mksp = 0.0
+
 
     # 训练循环
     for epoch in range(EPOCHS):
-        # torch.cuda.empty_cache()
         seed = 42 + epoch * world_size + local_rank
         torch.manual_seed(seed)
 
         np.random.seed(seed)
         random.seed(seed)
 
-        current_temp = TEMP_END + (TEMP_START - TEMP_END) * (1.0 - epoch / EPOCHS)
+        # current_temp = TEMP_END + (TEMP_START - TEMP_END) * (1.0 - epoch / EPOCHS)
+        current_temp = TEMP_END + (TEMP_START - TEMP_END) * (1.0 - global_step / total_steps)
 
-        train_data_list = epoch_dataset_gen(n_samples=local_n_simple, n_j=N_J, n_m=N_M, min_op=MIN_OP, max_op=MAX_OP)
+        train_data_list = DynamicFJSPDataset(num_samples=local_n_simple, n_j=N_J, n_m=N_M, min_op=MIN_OP, max_op=MAX_OP)
         train_loader = DataLoader(train_data_list, batch_size=BATCH_SIZE, shuffle=True,
-                                  num_workers=4, pin_memory=True)
+                                  num_workers=16, pin_memory=True)
 
         policy_model.train()
         total_loss = 0
@@ -143,11 +162,11 @@ def main():
                 if advantage.numel() > 1:
                     # advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
                     advantage = advantage / (advantage.std(unbiased=False) + 1e-8)
+                    advantage = torch.clamp(advantage, min=-5.0, max=5.0)
                 rl_loss = (advantage * log_probs).mean()
 
                 entropy_bonus = entropy.mean() * ENTROPY_COEF
                 loss = rl_loss - entropy_bonus
-                # loss = rl_loss
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -155,9 +174,47 @@ def main():
             torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
 
-            total_loss += loss.item()
-            total_train_mksp += costs.mean().item()
+            running_loss += loss.item()
+            running_train_mksp += costs.mean().item()
+
+        if global_step % VAL_FREQ == 0 or global_step == total_steps:
+            # 跨进程汇总过去 VAL_FREQ 步的累积数据
+            metrics = torch.tensor([running_loss, running_train_mksp], device=DEVICE)
+            dist.reduce(metrics, dst=0, op=dist.ReduceOp.SUM)
+
+            update_flag = torch.tensor([0], device=DEVICE)
+
+            if local_rank == 0:
+                # 计算这段时间内的真实平均值
+                avg_loss = metrics[0].item() / (VAL_FREQ * world_size)
+                avg_train_mksp = metrics[1].item() / (VAL_FREQ * world_size)
+                current_lr = scheduler.get_last_lr()[0]
+
+                # 模型验证
+                policy_model.eval()
+                policy_val_costs = validate_model(policy_model, val_loader, DEVICE, N_J, N_M, MAX_OP)
+                policy_model.train()  # 验证完切回 train
+
+                avg_val_mksp = policy_val_costs.mean()
+
+                wandb.log({
+                    "Step": global_step,
+                    "Epoch": epoch + 1,
+                    "Loss/Train": avg_loss,
+                    "Makespan/Train": avg_train_mksp,
+                    "Makespan/Validation": avg_val_mksp,
+                    "Temperature": current_temp,
+                    "Learning_Rate": current_lr
+                }, step=global_step)
+
+                print(
+                    f"Epoch {epoch + 1} | Step {global_step}/{total_steps} | LR {current_lr:.6f} | Loss {avg_loss:.4f} | Train Mksp {avg_train_mksp:.2f} | Val Mksp {avg_val_mksp:.2f}")
+
+                history_loss.append(avg_loss)
+                history_train_mksp.append(avg_train_mksp)
+                history_val_mksp.append(avg_val_mksp)
 
         metrics = torch.tensor([total_loss, total_train_mksp], device=DEVICE)
         dist.reduce(metrics, dst=0, op=dist.ReduceOp.SUM)
@@ -205,6 +262,8 @@ def main():
             if local_rank == 0:
                 print("Updating Baseline...")
             baseline_model.load_state_dict(policy_model.module.state_dict())
+        running_loss = 0.0
+        running_train_mksp = 0.0
 
     if local_rank == 0:
         print("Training finished. Plotting curves...")

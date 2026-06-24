@@ -5,6 +5,23 @@ from Params import configs
 from multiprocessing import Pool
 from functools import partial
 from torch_geometric.data import HeteroData
+from torch.utils.data import Dataset
+
+
+class DynamicFJSPDataset(Dataset):
+    def __init__(self, num_samples, n_j, n_m, min_op, max_op):
+        self.num_samples = num_samples
+        self.n_j = n_j
+        self.n_m = n_m
+        self.min_op = min_op
+        self.max_op = max_op
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        data = _generate_single_instance(idx, self.n_j, self.n_m, self.min_op, self.max_op, return_pyg=True)
+        return data
 
 
 def get_initial_input(n_j, n_m, max_n_op, proc_times, compat_mask, job_length):
