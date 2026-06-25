@@ -86,7 +86,7 @@ def run_public_benchmark():
 
 
     # 1. 初始化并加载 RL 模型
-    model_path = os.path.join("models_save", f"10_5_best_model_256.pth")
+    model_path = os.path.join("models_save", f"15_10_best_model_64.pth")
     if not os.path.exists(model_path):
         print(f"找不到模型权重文件: {model_path}")
         return

@@ -49,7 +49,7 @@ def main():
     baseline_model = deepcopy(policy_model)
     baseline_model.eval()
 
-    policy_model = DDP(policy_model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    policy_model = DDP(policy_model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     # [修改] 基础优化器设置（学习率由 Scheduler 完全接管）
     optimizer = optim.AdamW(policy_model.parameters(), lr=MAX_LR, weight_decay=1e-4)
@@ -104,11 +104,12 @@ def main():
 
     dist.barrier()
 
-    global_step = 0  # [新增] 全局 Step 计数器
+    global_step = 0
 
     # 用于收集在 VAL_FREQ 期间的平均训练指标
     running_loss = 0.0
     running_train_mksp = 0.0
+    running_steps = 0
 
     # 训练循环
     for epoch in range(EPOCHS):
@@ -125,6 +126,7 @@ def main():
 
         for step_idx, batch in enumerate(train_loader):
             global_step += 1
+            running_steps += 1
 
             # [修改] 每一步平滑衰减温度，而不是每个 Epoch 才变
             current_temp = TEMP_END + (TEMP_START - TEMP_END) * (1.0 - global_step / total_steps)
@@ -176,11 +178,8 @@ def main():
             running_loss += loss.item()
             running_train_mksp += costs.mean().item()
 
-            # ==============================================================
-            # [核心修改] 每 VAL_FREQ 步，进行验证和 Baseline 切换评估
-            # ==============================================================
-            if global_step % VAL_FREQ == 0 or global_step == total_steps:
-                # 跨进程汇总过去 VAL_FREQ 步的累积数据
+            is_last_step_of_epoch = (step_idx == len(train_loader) - 1)
+            if running_steps >= VAL_FREQ or is_last_step_of_epoch:
                 metrics = torch.tensor([running_loss, running_train_mksp], device=DEVICE)
                 dist.reduce(metrics, dst=0, op=dist.ReduceOp.SUM)
 
@@ -242,6 +241,7 @@ def main():
                 # 重置累积数据供下一个 VAL_FREQ 使用
                 running_loss = 0.0
                 running_train_mksp = 0.0
+                running_steps = 0
 
     if local_rank == 0:
         print("Training finished. Plotting curves...")
